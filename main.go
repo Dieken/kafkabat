@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -32,7 +31,7 @@ func main() {
 	flag.Usage = usage
 	flag.StringVarP(&flags.brokers, "broker", "b", "localhost:9092", "Kafka broker bootstrap servers, separated by comma")
 	flag.StringVarP(&flags.topic, "topic", "t", "", "Kafka topic name")
-	flag.IntVarP(&flags.partition, "partition", "p", -1, "partition, -1 means all")
+	flag.Int32VarP(&flags.partition, "partition", "p", -1, "partition, -1 means all")
 	flag.StringVarP(&flags.offset, "offset", "o", "end", "offset to start consuming")
 	flag.StringVarP(&flags.registry, "registry", "r", "http://localhost:8081", "schema regisry URL")
 	flag.StringVarP(&flags.keySchema, "key-schema", "K", "", "key schema, can be numeric ID, file path or AVRO schema definition")
@@ -69,7 +68,7 @@ func main() {
 type Flags struct {
 	brokers      string
 	topic        string
-	partition    int
+	partition    int32
 	offset       string
 	registry     string
 	keySchema    string
@@ -118,34 +117,35 @@ func runProducer(flags *Flags) {
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Idempotent = true
 	config.Net.MaxOpenRequests = 1
+	if flags.partition >= 0 {
+		config.Producer.Partitioner = sarama.NewManualPartitioner
+	}
 	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
 		log.Fatalln("invalid kafka version")
 	}
 
-	producer, err := sarama.NewAsyncProducer(strings.Split(flags.brokers, ","), config)
+	client, err := sarama.NewClient(strings.Split(flags.brokers, ","), config)
+	if err != nil {
+		log.Fatalln("failed to create client:", err)
+	}
+	defer client.Close()
+
+	producer, err := sarama.NewSyncProducerFromClient(client)
 	if err != nil {
 		log.Fatalln("failed to create producer:", err)
 	}
+	defer producer.Close()
 
+	done := false
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-
-	var (
-		wg                  sync.WaitGroup
-		enqueues, successes int
-	)
-
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		for msg := range producer.Successes() {
-			successes++
-			s, _ := json.Marshal(msg)
-			log.Printf("%d enqueued, %d succeeded, partition=%d, offset=%d, msg=%s\n",
-				enqueues, successes, msg.Partition, msg.Offset, s)
-		}
+		signal := <-signals
+		log.Println("got signal:", signal)
+		done = true
 	}()
 
+	successes := 0
 	if flag.NArg() > 1 {
 		argKey, argValue := flag.Arg(0), flag.Arg(1)
 
@@ -159,9 +159,7 @@ func runProducer(flags *Flags) {
 			log.Fatalf("failed to encode value `%s`: %s", argValue, err)
 		}
 
-		if sendMessage(producer, flags.topic, key, value, signals) {
-			enqueues++
-		}
+		sendMessage(producer, flags.topic, flags.partition, key, value, &successes)
 	} else {
 		filename := flag.Arg(0)
 		f := os.Stdin
@@ -213,17 +211,11 @@ func runProducer(flags *Flags) {
 				log.Fatalf("failed to encode value `%v`: %s", jsonValue, err)
 			}
 
-			if sendMessage(producer, flags.topic, key, value, signals) {
-				enqueues++
-			} else {
+			if done || !sendMessage(producer, flags.topic, flags.partition, key, value, &successes) {
 				break
 			}
 		}
 	}
-
-	producer.AsyncClose()
-	wg.Wait()
-	log.Printf("Totally %d enqueued, %d succeeded.\n", enqueues, successes)
 }
 
 func runConsumer(flags *Flags) {
@@ -288,20 +280,16 @@ func json2Avro(schema *srclient.Schema, obj interface{}) (sarama.Encoder, error)
 	return encode(schema, obj)
 }
 
-func sendMessage(producer sarama.AsyncProducer, topic string, key sarama.Encoder, value sarama.Encoder, signals chan os.Signal) bool {
-	ok := false
-
-	select {
-	case producer.Input() <- &sarama.ProducerMessage{Topic: topic, Key: key, Value: value, Timestamp: time.Now()}:
-		ok = true
-
-	case err := <-producer.Errors():
-		s, _ := json.Marshal(err.Msg)
-		log.Printf("failed to send, err=%s msg=%s\n", err.Error, s)
-
-	case signal := <-signals:
-		log.Println("got signal:", signal)
+func sendMessage(producer sarama.SyncProducer, topic string, partition int32, key sarama.Encoder, value sarama.Encoder, successes *int) bool {
+	msg := sarama.ProducerMessage{Topic: topic, Partition: partition, Key: key, Value: value, Timestamp: time.Now()}
+	partition, offset, err := producer.SendMessage(&msg)
+	s, _ := json.Marshal(msg)
+	if err != nil {
+		log.Printf("failed to send, err=%s msg=%s\n", err.Error(), s)
+		return false
 	}
 
-	return ok
+	*successes++
+	log.Printf("[%d] partition=%d, offset=%d, msg=%s\n", *successes, partition, offset, s)
+	return true
 }
