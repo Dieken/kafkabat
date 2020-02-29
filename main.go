@@ -178,26 +178,8 @@ func runProducer(flags *Flags) {
 				log.Fatal(err)
 			}
 
-			var jsonKey, jsonValue interface{}
-			var ok bool
-			if jsonKey, ok = m["Key"]; !ok {
-				if jsonKey, ok = m["key"]; !ok {
-					log.Println("no `Key` or `key` field found in object", m)
-					continue
-				}
-			}
-			if jsonKey == nil {
-				log.Println("skip null key for object", m)
-				continue
-			}
-			if jsonValue, ok = m["Value"]; !ok {
-				if jsonValue, ok = m["value"]; !ok {
-					log.Println("no `Value` or `value` field found in object", m)
-					continue
-				}
-			}
-			if jsonValue == nil {
-				log.Println("skip null value for object", m)
+			jsonKey, jsonValue, ok := getKeyValueFromMap(&m)
+			if !ok {
 				continue
 			}
 
@@ -285,11 +267,34 @@ func sendMessage(producer sarama.SyncProducer, topic string, partition int32, ke
 	partition, offset, err := producer.SendMessage(&msg)
 	s, _ := json.Marshal(msg)
 	if err != nil {
-		log.Printf("failed to send, err=%s msg=%s\n", err.Error(), s)
+		log.Printf("failed to send, err=%s, msg=%s\n", err.Error(), s)
 		return false
 	}
 
 	*successes++
 	log.Printf("[%d] partition=%d, offset=%d, msg=%s\n", *successes, partition, offset, s)
 	return true
+}
+
+func getFieldFromMap(m *map[string]interface{}, k1 string, k2 string) (interface{}, bool) {
+	var value interface{}
+	var ok bool
+	if value, ok = (*m)[k1]; !ok {
+		if value, ok = (*m)[k2]; !ok {
+			log.Printf("no `%s` or `%s` field found in object %s\n", k1, k2, m)
+			return nil, false
+		}
+	}
+	if value == nil {
+		log.Printf("skip null %s in object %s\n", k2, m)
+		return nil, false
+	}
+
+	return value, true
+}
+
+func getKeyValueFromMap(m *map[string]interface{}) (interface{}, interface{}, bool) {
+	key, ok1 := getFieldFromMap(m, "Key", "key")
+	value, ok2 := getFieldFromMap(m, "Value", "value")
+	return key, value, ok1 && ok2
 }
