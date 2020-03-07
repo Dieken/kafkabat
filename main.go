@@ -94,7 +94,7 @@ type Flags struct {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `Usage:
+	fmt.Fprint(os.Stderr, `Usage:
     Produce:
         kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] key value
         kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] file
@@ -123,6 +123,7 @@ func listTopic(flags *Flags) {
 
 	config := sarama.NewConfig()
 	config.Consumer.Return.Errors = true
+
 	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
 		log.Fatalln("invalid kafka version")
 	}
@@ -157,6 +158,7 @@ func listTopic(flags *Flags) {
 			if err != nil {
 				log.Fatalf("failed to get oldest offset for topic %s partition %d: %s\n", topic, partition, err)
 			}
+
 			maxOffset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
 			if err != nil {
 				log.Fatalf("failed to get newest offset for topic %s partition %d: %s\n", topic, partition, err)
@@ -188,6 +190,7 @@ func runProducer(flags *Flags) {
 	if err != nil {
 		log.Fatalln("invalid key schema:", err)
 	}
+
 	valueSchema, err := createSchema(registry, flags.valueSchema, flags.topic, false)
 	if err != nil {
 		log.Fatalln("invalid value schema:", err)
@@ -200,9 +203,11 @@ func runProducer(flags *Flags) {
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Idempotent = true
 	config.Net.MaxOpenRequests = 1
+
 	if flags.partition >= 0 {
 		config.Producer.Partitioner = sarama.NewManualPartitioner
 	}
+
 	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
 		log.Fatalln("invalid kafka version")
 	}
@@ -222,13 +227,16 @@ func runProducer(flags *Flags) {
 	done := false
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
 		signal := <-signals
-		log.Println("got signal:", signal)
 		done = true
+
+		log.Println("got signal:", signal)
 	}()
 
 	successes := 0
+
 	if flag.NArg() > 1 {
 		argKey, argValue := flag.Arg(0), flag.Arg(1)
 
@@ -284,10 +292,12 @@ func runProducer(flags *Flags) {
 }
 
 func runConsumer(flags *Flags) {
-	var err error
-	var count uint64
-	var offset int64
-	var offsetIsTime bool
+	var (
+		err          error
+		count        uint64
+		offset       int64
+		offsetIsTime bool
+	)
 
 	if flags.offset == "begin" {
 		offset = sarama.OffsetOldest
@@ -308,6 +318,7 @@ func runConsumer(flags *Flags) {
 
 	config := sarama.NewConfig()
 	config.Consumer.Return.Errors = true
+
 	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
 		log.Fatalln("invalid kafka version")
 	}
@@ -331,6 +342,7 @@ func runConsumer(flags *Flags) {
 
 	wg := sync.WaitGroup{}
 	lock := sync.Mutex{}
+
 	for _, partition := range partitions {
 		if flags.partition >= 0 && flags.partition != partition {
 			continue
@@ -401,6 +413,7 @@ func runConsumer(flags *Flags) {
 						"key":       key,
 						"value":     value,
 					}
+
 					s, err := json.Marshal(m)
 					if err != nil {
 						log.Printf("failed to serialize to JSON, topic=%s partition=%d offset=%d: %s\n", flags.topic, partition, msg.Offset, err)
@@ -410,6 +423,7 @@ func runConsumer(flags *Flags) {
 					if flags.count > 0 && atomic.AddUint64(&count, 1) > flags.count {
 						return
 					}
+
 					lock.Lock()
 					fmt.Println(string(s))
 					lock.Unlock()
@@ -440,21 +454,23 @@ func createSchema(registry *srclient.SchemaRegistryClient, schema string, topic 
 		if err != nil && strings.HasPrefix(err.Error(), "404 Not Found") {
 			return nil, nil
 		}
+
 		return s, err
 	}
 
 	if _, err := os.Stat(schema); os.IsNotExist(err) {
-		if id, err := strconv.Atoi(schema); err != nil {
-			return registry.CreateSchema(topic, schema, isKey)
-		} else {
+		if id, err := strconv.Atoi(schema); err == nil {
 			return registry.GetSchema(id)
 		}
+
+		return registry.CreateSchema(topic, schema, isKey)
 	}
 
 	content, err := ioutil.ReadFile(schema)
 	if err != nil {
 		return nil, err
 	}
+
 	return registry.CreateSchema(topic, string(content), isKey)
 }
 
@@ -462,11 +478,13 @@ func encode(schema *srclient.Schema, datum interface{}) (sarama.ByteEncoder, err
 	buffer := make([]byte, 5, 256)
 	buffer[0] = 0
 	binary.BigEndian.PutUint32(buffer[1:5], uint32(schema.ID()))
-	if bytes, err := schema.Codec().BinaryFromNative(buffer, datum); err != nil {
+
+	bytes, err := schema.Codec().BinaryFromNative(buffer, datum)
+	if err != nil {
 		return nil, err
-	} else {
-		return sarama.ByteEncoder(bytes), nil
 	}
+
+	return sarama.ByteEncoder(bytes), nil
 }
 
 func str2Avro(schema *srclient.Schema, s string) (sarama.Encoder, error) {
@@ -483,24 +501,27 @@ func str2Avro(schema *srclient.Schema, s string) (sarama.Encoder, error) {
 }
 
 func json2Avro(schema *srclient.Schema, obj interface{}) (sarama.Encoder, error) {
-	if schema == nil {
-		if s, ok := obj.(string); ok {
-			return sarama.StringEncoder(s), nil
-		}
-		if bytes, err := json.Marshal(obj); err != nil {
-			return nil, err
-		} else {
-			return sarama.ByteEncoder(bytes), nil
-		}
+	if schema != nil {
+		return encode(schema, obj)
 	}
 
-	return encode(schema, obj)
+	if s, ok := obj.(string); ok {
+		return sarama.StringEncoder(s), nil
+	}
+
+	bytes, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+
+	return sarama.ByteEncoder(bytes), nil
 }
 
 func sendMessage(producer sarama.SyncProducer, topic string, partition int32, key sarama.Encoder, value sarama.Encoder, successes *int) bool {
 	msg := sarama.ProducerMessage{Topic: topic, Partition: partition, Key: key, Value: value, Timestamp: time.Now()}
 	partition, offset, err := producer.SendMessage(&msg)
 	s, _ := json.Marshal(msg)
+
 	if err != nil {
 		log.Printf("failed to send, err=%s, msg=%s\n", err.Error(), s)
 		return false
@@ -508,18 +529,23 @@ func sendMessage(producer sarama.SyncProducer, topic string, partition int32, ke
 
 	*successes++
 	log.Printf("[%d] partition=%d, offset=%d, msg=%s\n", *successes, partition, offset, s)
+
 	return true
 }
 
 func getFieldFromMap(m map[string]interface{}, k1 string, k2 string) (interface{}, bool) {
-	var value interface{}
-	var ok bool
+	var (
+		value interface{}
+		ok    bool
+	)
+
 	if value, ok = m[k1]; !ok {
 		if value, ok = m[k2]; !ok {
 			log.Printf("no `%s` or `%s` field found in object %s\n", k1, k2, m)
 			return nil, false
 		}
 	}
+
 	if value == nil {
 		log.Printf("skip null %s in object %s\n", k2, m)
 		return nil, false
@@ -531,6 +557,7 @@ func getFieldFromMap(m map[string]interface{}, k1 string, k2 string) (interface{
 func getKeyValueFromMap(m map[string]interface{}) (interface{}, interface{}, bool) {
 	key, ok1 := getFieldFromMap(m, "Key", "key")
 	value, ok2 := getFieldFromMap(m, "Value", "value")
+
 	return key, value, ok1 && ok2
 }
 
@@ -561,11 +588,13 @@ func decode(registry *srclient.SchemaRegistryClient, msg []byte) (interface{}, e
 	}
 
 	schemaID := binary.BigEndian.Uint32(msg[1:5])
+
 	schema, err := registry.GetSchema(int(schemaID))
 	if err != nil {
 		return nil, err
 	}
 
 	datum, _, err := schema.Codec().NativeFromBinary(msg[5:])
+
 	return datum, err
 }
