@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/araddon/dateparse"
 	"github.com/riferrei/srclient"
 	flag "github.com/spf13/pflag"
 )
@@ -35,7 +36,7 @@ func main() {
 	flag.StringVarP(&flags.brokers, "broker", "b", "localhost:9092", "Kafka broker bootstrap servers, separated by comma")
 	flag.StringVarP(&flags.topic, "topic", "t", "", "Kafka topic name")
 	flag.Int32VarP(&flags.partition, "partition", "p", -1, "partition, -1 means all")
-	flag.StringVarP(&flags.offset, "offset", "o", "begin", "offset to start consuming, possile values: begin, end, positive integer, RFC3339 timestamp")
+	flag.StringVarP(&flags.offset, "offset", "o", "begin", "offset to start consuming, possile values: begin, end, positive integer, timestamp")
 	flag.Uint64VarP(&flags.count, "count", "c", 0, "maximum count of messages to consume, 0 means no limit")
 	flag.StringVarP(&flags.registry, "registry", "r", "http://localhost:8081", "schema regisry URL")
 	flag.StringVarP(&flags.keySchema, "key-schema", "K", "", "key schema, can be numeric ID, file path or AVRO schema definition")
@@ -292,11 +293,11 @@ func runConsumer(flags *Flags) {
 		offset = sarama.OffsetOldest
 	} else if flags.offset == "end" {
 		offset = sarama.OffsetNewest
-	} else if t, err := time.ParseInLocation(time.RFC3339, flags.offset, time.Local); err == nil {
+	} else if t, err := dateparse.ParseLocal(flags.offset); err == nil {
 		offsetIsTime = true
 		offset = t.UnixNano() / 1e6
 	} else if offset, err = strconv.ParseInt(flags.offset, 10, 64); err != nil || offset < 0 {
-		log.Fatalln("`offset` must be `begin`, `end`, positive integer or RFC3339 timestamp")
+		log.Fatalln("`offset` must be `begin`, `end`, positive integer or timestamp")
 	}
 
 	registry := srclient.CreateSchemaRegistryClient(flags.registry)
