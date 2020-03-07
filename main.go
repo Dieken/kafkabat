@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,11 +34,13 @@ func main() {
 	flag.StringVarP(&flags.brokers, "broker", "b", "localhost:9092", "Kafka broker bootstrap servers, separated by comma")
 	flag.StringVarP(&flags.topic, "topic", "t", "", "Kafka topic name")
 	flag.Int32VarP(&flags.partition, "partition", "p", -1, "partition, -1 means all")
-	flag.StringVarP(&flags.offset, "offset", "o", "end", "offset to start consuming")
+	flag.StringVarP(&flags.offset, "offset", "o", "begin", "offset to start consuming, possile values: begin, end, positive integer")
 	flag.StringVarP(&flags.registry, "registry", "r", "http://localhost:8081", "schema regisry URL")
 	flag.StringVarP(&flags.keySchema, "key-schema", "K", "", "key schema, can be numeric ID, file path or AVRO schema definition")
 	flag.StringVarP(&flags.valueSchema, "value-schema", "V", "", "value schema, can be numeric ID, file path or AVRO schema definition")
 	flag.StringVar(&flags.kafkaVersion, "kafka-version", "2.3.0", "Kafka server version")
+	flag.BoolVarP(&flags.follow, "follow", "f", false, "continue consuming when reach partition end")
+	flag.BoolVarP(&flags.list, "list", "l", false, "list partition meta information")
 	flag.BoolVarP(&flags.help, "help", "h", false, "show this help")
 	flag.BoolVarP(&flags.version, "version", "v", false, "show version")
 
@@ -50,6 +54,11 @@ func main() {
 	if flags.help {
 		usage()
 		os.Exit(1)
+	}
+
+	if flags.list {
+		listTopic(&flags)
+		return
 	}
 
 	if flags.topic == "" {
@@ -74,28 +83,98 @@ type Flags struct {
 	keySchema    string
 	valueSchema  string
 	kafkaVersion string
+	list         bool
+	follow       bool
 	help         bool
 	version      bool
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage:
-    Producer:
-        kafkabat KAFKA_OPTS REGISTRY_OPTS key value
-        kafkabat KAFKA_OPTS REGISTRY_OPTS [json_stream_file | -]
+    Produce:
+        kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] key value
+		kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] file
 
-    Consumer:
-        kafkabat KAFKA_OPTS REGISTRY_OPTS [--offset=OFFSET]
+			If "file" is "-", read line-by-line JSON objects from stdin, the object must contain keys "key" and "value".
+
+    Consume:
+        kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--offset=OFFSET] [--follow]
+
+    List:
+        kafkabat KAFKA_OPTS [--topic=TOPIC] --list
 
     KAFKA_OPTS:
-        [--broker=BROKERS] --topic=TOPIC [--partition=N] [--kafka-version=VERSION]
+        [--broker=BROKERS] [--kafka-version=VERSION]
 
     REGISTRY_OPTS
-        [--registry=URL] [--key-schema=SCHEMA] [--value-schema=SCHEMA]
+        [--registry=URL]
 
 `)
 
 	flag.PrintDefaults()
+}
+
+func listTopic(flags *Flags) {
+	var err error
+
+	config := sarama.NewConfig()
+	config.Consumer.Return.Errors = true
+	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
+		log.Fatalln("invalid kafka version")
+	}
+
+	client, err := sarama.NewClient(strings.Split(flags.brokers, ","), config)
+	if err != nil {
+		log.Fatalln("failed to create create:", err)
+	}
+	defer client.Close()
+
+	topics, err := client.Topics()
+	if err != nil {
+		log.Fatalln("failed to get topics:", err)
+	}
+
+	for _, topic := range topics {
+		if flags.topic != "" && flags.topic != topic {
+			continue
+		}
+
+		partitions, err := client.Partitions(topic)
+		if err != nil {
+			log.Fatalf("failed to list partitions for topic %s: %s\n", topic, err)
+		}
+
+		for _, partition := range partitions {
+			if flags.partition >= 0 && flags.partition != partition {
+				continue
+			}
+
+			minOffset, err := client.GetOffset(topic, partition, sarama.OffsetOldest)
+			if err != nil {
+				log.Fatalf("failed to get oldest offset for topic %s partition %d: %s\n", topic, partition, err)
+			}
+			maxOffset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
+			if err != nil {
+				log.Fatalf("failed to get newest offset for topic %s partition %d: %s\n", topic, partition, err)
+			}
+
+			if minOffset == maxOffset {
+				fmt.Printf("topic=%s partition=%d minOffset=%d maxOffset=%d\n", topic, partition, minOffset, maxOffset)
+			} else {
+				minMsg, err := getMessageByOffset(client, topic, partition, minOffset)
+				if err != nil {
+					log.Fatalf("failed to get first message for topic %s partition %d: %s\n", topic, partition, err)
+				}
+				// due to holes in segment, it's not reliable to obtain previous message
+				//maxMsg, err := getMessageByOffset(client, topic, partition, maxOffset-1)
+				//if err != nil {
+				//	log.Fatalf("failed to get last message for topic %s partition %d: %s\n", topic, partition, err)
+				//}
+				fmt.Printf("topic=%s partition=%d minOffset=%d maxOffset=%d minTime=%s\n",
+					topic, partition, minMsg.Offset, maxOffset, minMsg.Timestamp.Format(time.RFC3339))
+			}
+		}
+	}
 }
 
 func runProducer(flags *Flags) {
@@ -178,7 +257,7 @@ func runProducer(flags *Flags) {
 				log.Fatal(err)
 			}
 
-			jsonKey, jsonValue, ok := getKeyValueFromMap(&m)
+			jsonKey, jsonValue, ok := getKeyValueFromMap(m)
 			if !ok {
 				continue
 			}
@@ -201,11 +280,150 @@ func runProducer(flags *Flags) {
 }
 
 func runConsumer(flags *Flags) {
+	var err error
+
+	var offset int64
+	if flags.offset == "begin" {
+		offset = sarama.OffsetOldest
+	} else if flags.offset == "end" {
+		offset = sarama.OffsetNewest
+	} else {
+		if offset, err = strconv.ParseInt(flags.offset, 10, 64); err != nil || offset < 0 {
+			log.Fatalln("`offset` must be `begin`, `end` or positive integer")
+		}
+	}
+
+	registry := srclient.CreateSchemaRegistryClient(flags.registry)
+	keySchema, _ := registry.GetLatestSchema(flags.topic, true)
+	valueSchema, _ := registry.GetLatestSchema(flags.topic, false)
+	hasKeySchema := keySchema != nil
+	hasValueSchema := valueSchema != nil
+
+	config := sarama.NewConfig()
+	config.Consumer.Return.Errors = true
+	if config.Version, err = sarama.ParseKafkaVersion(flags.kafkaVersion); err != nil {
+		log.Fatalln("invalid kafka version")
+	}
+
+	client, err := sarama.NewClient(strings.Split(flags.brokers, ","), config)
+	if err != nil {
+		log.Fatalln("failed to create create:", err)
+	}
+	defer client.Close()
+
+	consumer, err := sarama.NewConsumerFromClient(client)
+	if err != nil {
+		log.Fatalln("failed to create consumer:", err)
+	}
+	defer consumer.Close()
+
+	partitions, err := client.Partitions(flags.topic)
+	if err != nil {
+		log.Fatalf("failed to list partitions for topic %s: %s\n", flags.topic, err)
+	}
+
+	wg := sync.WaitGroup{}
+	lock := sync.Mutex{}
+	for _, partition := range partitions {
+		if flags.partition >= 0 && flags.partition != partition {
+			continue
+		}
+
+		newestOffset, err := client.GetOffset(flags.topic, partition, sarama.OffsetNewest)
+		if err != nil {
+			log.Fatalf("failed to get newest offset for topic %s parition %d: %s\n", flags.topic, partition, err)
+		}
+
+		startOffset := offset
+		if startOffset == sarama.OffsetNewest || startOffset >= newestOffset {
+			if !flags.follow {
+				log.Printf("`--follow` isn't specified, won't consume partition %d from end\n", partition)
+				continue
+			} else {
+				startOffset = newestOffset
+			}
+		}
+
+		wg.Add(1)
+		go func(partition int32, newestOffset int64, startOffset int64) {
+			defer wg.Done()
+
+			partitionConsumer, err := consumer.ConsumePartition(flags.topic, partition, startOffset)
+			if err != nil {
+				log.Printf("failed to consume partition %d for topic %s: %s\n", partition, flags.topic, err)
+				return
+			}
+			defer partitionConsumer.Close()
+
+			for {
+				select {
+				case msg := <-partitionConsumer.Messages():
+					var key, value interface{}
+
+					if hasKeySchema {
+						key, err = decode(registry, msg.Key)
+						if err != nil {
+							log.Printf("failed to decode message key, topic=%s partition=%d offset=%d: %s\n", flags.topic, partition, msg.Offset, err)
+							break
+						}
+					} else {
+						key = string(msg.Key)
+					}
+
+					if hasValueSchema {
+						value, err = decode(registry, msg.Value)
+						if err != nil {
+							log.Printf("failed to decode message value, topic=%s partition=%d offset=%d: %s\n", flags.topic, partition, msg.Offset, err)
+							break
+						}
+					} else {
+						value = string(msg.Value)
+					}
+
+					m := map[string]interface{}{
+						"topic":     flags.topic,
+						"partition": partition,
+						"offset":    msg.Offset,
+						"timestamp": msg.Timestamp,
+						"key":       key,
+						"value":     value,
+					}
+					s, err := json.Marshal(m)
+					if err != nil {
+						log.Printf("failed to serialize to JSON, topic=%s partition=%d offset=%d: %s\n", flags.topic, partition, msg.Offset, err)
+						break
+					}
+					lock.Lock()
+					fmt.Println(string(s))
+					lock.Unlock()
+
+					if !flags.follow && msg.Offset >= newestOffset-1 {
+						return
+					}
+
+				case <-time.After(2 * time.Second):
+					if !flags.follow {
+						return
+					}
+
+				case err := <-partitionConsumer.Errors():
+					log.Printf("failed to consume partition %d for topic %s: %s\n", partition, flags.topic, err)
+					return
+				}
+			}
+		}(partition, newestOffset, startOffset)
+	}
+
+	wg.Wait()
 }
 
 func createSchema(registry *srclient.SchemaRegistryClient, schema string, topic string, isKey bool) (*srclient.Schema, error) {
 	if schema == "" {
-		return nil, nil
+		s, err := registry.GetLatestSchema(topic, isKey)
+		if err != nil && strings.HasPrefix(err.Error(), "404 Not Found") {
+			return nil, nil
+		}
+		return s, err
 	}
 
 	if _, err := os.Stat(schema); os.IsNotExist(err) {
@@ -276,11 +494,11 @@ func sendMessage(producer sarama.SyncProducer, topic string, partition int32, ke
 	return true
 }
 
-func getFieldFromMap(m *map[string]interface{}, k1 string, k2 string) (interface{}, bool) {
+func getFieldFromMap(m map[string]interface{}, k1 string, k2 string) (interface{}, bool) {
 	var value interface{}
 	var ok bool
-	if value, ok = (*m)[k1]; !ok {
-		if value, ok = (*m)[k2]; !ok {
+	if value, ok = m[k1]; !ok {
+		if value, ok = m[k2]; !ok {
 			log.Printf("no `%s` or `%s` field found in object %s\n", k1, k2, m)
 			return nil, false
 		}
@@ -293,8 +511,44 @@ func getFieldFromMap(m *map[string]interface{}, k1 string, k2 string) (interface
 	return value, true
 }
 
-func getKeyValueFromMap(m *map[string]interface{}) (interface{}, interface{}, bool) {
+func getKeyValueFromMap(m map[string]interface{}) (interface{}, interface{}, bool) {
 	key, ok1 := getFieldFromMap(m, "Key", "key")
 	value, ok2 := getFieldFromMap(m, "Value", "value")
 	return key, value, ok1 && ok2
+}
+
+func getMessageByOffset(client sarama.Client, topic string, partition int32, offset int64) (*sarama.ConsumerMessage, error) {
+	consumer, err := sarama.NewConsumerFromClient(client)
+	if err != nil {
+		return nil, err
+	}
+	defer consumer.Close()
+
+	partitionConsumer, err := consumer.ConsumePartition(topic, partition, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer partitionConsumer.Close()
+
+	select {
+	case msg := <-partitionConsumer.Messages():
+		return msg, nil
+	case err := <-partitionConsumer.Errors():
+		return nil, err
+	}
+}
+
+func decode(registry *srclient.SchemaRegistryClient, msg []byte) (interface{}, error) {
+	if msg == nil || len(msg) < 6 {
+		return nil, errors.New("invalid message")
+	}
+
+	schemaID := binary.BigEndian.Uint32(msg[1:5])
+	schema, err := registry.GetSchema(int(schemaID))
+	if err != nil {
+		return nil, err
+	}
+
+	datum, _, err := schema.Codec().NativeFromBinary(msg[5:])
+	return datum, err
 }
