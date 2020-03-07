@@ -419,7 +419,7 @@ func runConsumer(flags *Flags) {
 					}
 
 				case <-time.After(2 * time.Second):
-					if !flags.follow || atomic.LoadUint64(&count) >= flags.count {
+					if !flags.follow || (flags.count > 0 && atomic.LoadUint64(&count) >= flags.count) {
 						return
 					}
 
