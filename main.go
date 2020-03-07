@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,7 +35,8 @@ func main() {
 	flag.StringVarP(&flags.brokers, "broker", "b", "localhost:9092", "Kafka broker bootstrap servers, separated by comma")
 	flag.StringVarP(&flags.topic, "topic", "t", "", "Kafka topic name")
 	flag.Int32VarP(&flags.partition, "partition", "p", -1, "partition, -1 means all")
-	flag.StringVarP(&flags.offset, "offset", "o", "begin", "offset to start consuming, possile values: begin, end, positive integer")
+	flag.StringVarP(&flags.offset, "offset", "o", "begin", "offset to start consuming, possile values: begin, end, positive integer, RFC3339 timestamp")
+	flag.Uint64VarP(&flags.count, "count", "c", 0, "maximum count of messages to consume, 0 means no limit")
 	flag.StringVarP(&flags.registry, "registry", "r", "http://localhost:8081", "schema regisry URL")
 	flag.StringVarP(&flags.keySchema, "key-schema", "K", "", "key schema, can be numeric ID, file path or AVRO schema definition")
 	flag.StringVarP(&flags.valueSchema, "value-schema", "V", "", "value schema, can be numeric ID, file path or AVRO schema definition")
@@ -79,6 +81,7 @@ type Flags struct {
 	topic        string
 	partition    int32
 	offset       string
+	count        uint64
 	registry     string
 	keySchema    string
 	valueSchema  string
@@ -93,12 +96,12 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `Usage:
     Produce:
         kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] key value
-		kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] file
+        kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--key-schema=SCHEMA] [--value-schema=SCHEMA] file
 
-			If "file" is "-", read line-by-line JSON objects from stdin, the object must contain keys "key" and "value".
+            If "file" is "-", read line-by-line JSON objects from stdin, the object must contain keys "key" and "value".
 
     Consume:
-        kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--offset=OFFSET] [--follow]
+        kafkabat KAFKA_OPTS REGISTRY_OPTS --topic=TOPIC [--partition=N] [--offset=OFFSET] [--count=N] [--follow]
 
     List:
         kafkabat KAFKA_OPTS [--topic=TOPIC] --list
@@ -281,16 +284,19 @@ func runProducer(flags *Flags) {
 
 func runConsumer(flags *Flags) {
 	var err error
-
+	var count uint64
 	var offset int64
+	var offsetIsTime bool
+
 	if flags.offset == "begin" {
 		offset = sarama.OffsetOldest
 	} else if flags.offset == "end" {
 		offset = sarama.OffsetNewest
-	} else {
-		if offset, err = strconv.ParseInt(flags.offset, 10, 64); err != nil || offset < 0 {
-			log.Fatalln("`offset` must be `begin`, `end` or positive integer")
-		}
+	} else if t, err := time.ParseInLocation(time.RFC3339, flags.offset, time.Local); err == nil {
+		offsetIsTime = true
+		offset = t.UnixNano() / 1e6
+	} else if offset, err = strconv.ParseInt(flags.offset, 10, 64); err != nil || offset < 0 {
+		log.Fatalln("`offset` must be `begin`, `end`, positive integer or RFC3339 timestamp")
 	}
 
 	registry := srclient.CreateSchemaRegistryClient(flags.registry)
@@ -335,9 +341,15 @@ func runConsumer(flags *Flags) {
 		}
 
 		startOffset := offset
+		if offsetIsTime {
+			startOffset, err = client.GetOffset(flags.topic, partition, startOffset)
+			if err != nil {
+				log.Fatalf("failed to get offset for topic %s partition %d since %s: %s\n", flags.topic, partition, flags.offset, err)
+			}
+		}
+
 		if startOffset == sarama.OffsetNewest || startOffset >= newestOffset {
 			if !flags.follow {
-				log.Printf("`--follow` isn't specified, won't consume partition %d from end\n", partition)
 				continue
 			} else {
 				startOffset = newestOffset
@@ -393,6 +405,10 @@ func runConsumer(flags *Flags) {
 						log.Printf("failed to serialize to JSON, topic=%s partition=%d offset=%d: %s\n", flags.topic, partition, msg.Offset, err)
 						break
 					}
+
+					if flags.count > 0 && atomic.AddUint64(&count, 1) > flags.count {
+						return
+					}
 					lock.Lock()
 					fmt.Println(string(s))
 					lock.Unlock()
@@ -402,7 +418,7 @@ func runConsumer(flags *Flags) {
 					}
 
 				case <-time.After(2 * time.Second):
-					if !flags.follow {
+					if !flags.follow || atomic.LoadUint64(&count) >= flags.count {
 						return
 					}
 
